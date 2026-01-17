@@ -7,7 +7,11 @@ if (!roomName) process.exit(1);
 
 const safeFilename = roomName.replace(/[^a-zA-Z0-9]/g, '-');
 const MEETING_URL = `https://meet.jit.si/${roomName}`;
-const RECORDING_PATH = `./recordings/${safeFilename}-${Date.now()}.mp4`;
+
+// --- CHANGED: Define paths for both files ---
+const TIMESTAMP = Date.now();
+const RECORDING_PATH_MP4 = `./recordings/${safeFilename}-${TIMESTAMP}.mp4`;
+const RECORDING_PATH_MP3 = `./recordings/${safeFilename}-${TIMESTAMP}.mp3`;
 const SIGNAL_FILE = `./signals/stop-${safeFilename}`;
 
 if (!fs.existsSync('./recordings')) fs.mkdirSync('./recordings');
@@ -64,85 +68,77 @@ if (!fs.existsSync('./recordings')) fs.mkdirSync('./recordings');
 
     await new Promise(r => setTimeout(r, 5000));
 
-    // Start FFmpeg
+    // --- CHANGED: FFmpeg Command for Dual Output ---
     const displayID = process.env.DISPLAY || ':1'; 
+    
     const ffmpeg = spawn('ffmpeg', [
-        '-y', '-f', 'x11grab', '-draw_mouse', '0', '-framerate', '30',
-        '-s', '1920x1080', '-i', displayID, '-f', 'pulse', '-i', 'BitSavvySink.monitor',
+        '-y', 
+        // INPUT 0: Video (Screen)
+        '-f', 'x11grab', '-draw_mouse', '0', '-framerate', '30', '-s', '1920x1080', '-i', displayID, 
+        // INPUT 1: Audio (Pulse)
+        '-f', 'pulse', '-i', 'BitSavvySink.monitor',
+        
+        // OUTPUT 1: MP4 (Video + Audio)
+        '-map', '0:v', // Use Input 0 for Video
+        '-map', '1:a', // Use Input 1 for Audio
         '-c:v', 'libx264', '-preset', 'superfast', '-crf', '18', '-pix_fmt', 'yuv420p',
-        '-c:a', 'aac', '-b:a', '192k', RECORDING_PATH
+        '-c:a', 'aac', '-b:a', '192k', 
+        RECORDING_PATH_MP4,
+
+        // OUTPUT 2: MP3 (Audio Only)
+        '-map', '1:a', // Use Input 1 for Audio
+        '-c:a', 'libmp3lame', // MP3 Encoder
+        '-q:a', '2', // Quality (VBR, roughly 190kbps)
+        RECORDING_PATH_MP3
     ]);
 
-    console.log(`[BOT] Recording started: ${RECORDING_PATH}`);
+    console.log(`[BOT] Recording started: MP4 & MP3`);
 
     // --- STATUS CHECK LOOP ---
     let aloneCounter = 0;
 
     const checkStatus = async () => {
-        // 1. CHECK FOR SERVER SIGNAL
         if (fs.existsSync(SIGNAL_FILE)) {
-            console.log("[BOT] 🛑 Stop signal received from Dashboard.");
+            console.log("[BOT] 🛑 Stop signal received.");
             try { fs.unlinkSync(SIGNAL_FILE); } catch(e) {}
             await gracefulExit();
             return;
         }
 
-        // 2. CHECK PARTICIPANT COUNT (Using membersCount property)
         try {
             const status = await page.evaluate(() => {
-                // Check if Jitsi API is ready
-                if (typeof APP === 'undefined') return { ready: false, reason: "APP undefined" };
-                if (!APP.conference) return { ready: false, reason: "APP.conference undefined" };
-                
-                // FIX: Use membersCount property
-                return { 
-                    ready: true, 
-                    count: APP.conference.membersCount 
-                };
+                if (typeof APP === 'undefined' || !APP.conference) return { ready: false };
+                return { ready: true, count: APP.conference.membersCount };
             });
 
             if (status.ready) {
-                console.log(`[HEARTBEAT] Participants: ${status.count} | Alone Checks: ${aloneCounter}/6`);
-                
-                // Logic: 1 participant means ONLY the bot is there
-                if (status.count <= 1) {
-                    aloneCounter++;
-                } else {
-                    aloneCounter = 0;
-                }
-            } else {
-                console.log(`[HEARTBEAT] Jitsi API not ready yet (${status.reason})...`);
+                console.log(`[HEARTBEAT] Participants: ${status.count}`);
+                if (status.count <= 1) aloneCounter++;
+                else aloneCounter = 0;
             }
 
-            // 3. AUTO STOP TRIGGER (30 Seconds Alone)
             if (aloneCounter >= 6) { 
-                console.log("[BOT] 📉 Meeting empty for 30 seconds. Auto-stopping.");
+                console.log("[BOT] 📉 Meeting empty. Auto-stopping.");
                 await gracefulExit();
             }
-
-        } catch (e) {
-            console.log(`[ERROR] Check loop failed: ${e.message}`);
-        }
+        } catch (e) { console.log(`[ERROR] Check loop: ${e.message}`); }
     };
 
     const checkerInterval = setInterval(checkStatus, 5000);
 
     async function gracefulExit() {
         clearInterval(checkerInterval);
-        console.log("[BOT] 💾 Saving file and shutting down...");
+        console.log("[BOT] 💾 Saving files and shutting down...");
         
         ffmpeg.kill('SIGINT'); 
-        await new Promise(r => setTimeout(r, 2000)); 
+        await new Promise(r => setTimeout(r, 3000)); // Give slightly more time for 2 files to close
         
         await browser.close();
         process.exit(0);
     }
 
-    // --- HARD LIMIT: 1 HOUR ---
-    console.log("[BOT] ⏳ 1-Hour Timer Started.");
     setTimeout(() => {
-        console.log("[BOT] ⏰ Time Limit Reached (1 Hour). Forcing exit.");
+        console.log("[BOT] ⏰ Time Limit Reached.");
         gracefulExit();
-    }, 1000 * 60 * 60); // 60 Minutes
-
+    }, 1000 * 60 * 60); 
 })();

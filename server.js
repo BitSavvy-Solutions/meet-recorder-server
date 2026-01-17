@@ -2,44 +2,64 @@ const express = require('express');
 const { spawn } = require('child_process');
 const fs = require('fs');
 const path = require('path');
-// --- NEW: Import Uploader ---
+
+// --- MODULE IMPORTS ---
 const { uploadToAzure } = require('./uploader'); 
+const { transcribeAudio } = require('./transcriber');
+const { createOutlinePage } = require('./outline');
 
 const app = express();
 const PORT = 3001;
 
-// --- SETUP DIRECTORIES & DB ---
-if (!fs.existsSync('./logs')) fs.mkdirSync('./logs');
-if (!fs.existsSync('./signals')) fs.mkdirSync('./signals');
-if (!fs.existsSync('./recordings')) fs.mkdirSync('./recordings');
-if (!fs.existsSync('./history.json')) fs.writeFileSync('./history.json', '[]');
+// --- FIX: USE ABSOLUTE PATHS ---
+const LOGS_DIR = path.join(__dirname, 'logs');
+const SIGNALS_DIR = path.join(__dirname, 'signals');
+const RECORDINGS_DIR = path.join(__dirname, 'recordings');
+const HISTORY_FILE = path.join(__dirname, 'history.json');
 
-app.use('/recordings', express.static(path.join(__dirname, 'recordings')));
+// --- SETUP DIRECTORIES & DB ---
+if (!fs.existsSync(LOGS_DIR)) fs.mkdirSync(LOGS_DIR);
+if (!fs.existsSync(SIGNALS_DIR)) fs.mkdirSync(SIGNALS_DIR);
+if (!fs.existsSync(RECORDINGS_DIR)) fs.mkdirSync(RECORDINGS_DIR);
+if (!fs.existsSync(HISTORY_FILE)) fs.writeFileSync(HISTORY_FILE, '[]');
+
+app.use('/recordings', express.static(RECORDINGS_DIR));
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
 const activeRecordings = {};
 
-const getHistory = () => JSON.parse(fs.readFileSync('./history.json'));
+// --- FIX: READ/WRITE TO ABSOLUTE PATH ---
+const getHistory = () => {
+    try {
+        return JSON.parse(fs.readFileSync(HISTORY_FILE));
+    } catch (e) {
+        return [];
+    }
+};
+
 const saveHistory = (record) => {
     const history = getHistory();
     history.unshift(record);
-    fs.writeFileSync('./history.json', JSON.stringify(history, null, 2));
+    fs.writeFileSync(HISTORY_FILE, JSON.stringify(history, null, 2));
 };
 
 // --- DASHBOARD UI ---
 app.get('/', (req, res) => {
     const history = getHistory();
     
+    // Auto-refresh if recording is active OR transcription is processing
+    const isProcessing = Object.keys(activeRecordings).length > 0 || history.some(h => h.transcription && h.transcription.status === 'processing');
+
     res.send(`
     <!DOCTYPE html>
     <html>
     <head>
         <title>BitSavvy Recorder</title>
-        ${Object.keys(activeRecordings).length > 0 ? '<meta http-equiv="refresh" content="5">' : ''}
+        ${isProcessing ? '<meta http-equiv="refresh" content="5">' : ''}
         <style>
             body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; padding: 20px; background: #f4f4f9; color: #333; }
-            .container { max-width: 1000px; margin: 0 auto; }
+            .container { max-width: 1200px; margin: 0 auto; }
             .header { background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); margin-bottom: 20px; }
             h1 { margin: 0 0 15px 0; font-size: 24px; }
             .input-group { display: flex; gap: 10px; }
@@ -50,8 +70,11 @@ app.get('/', (req, res) => {
             th, td { padding: 12px; text-align: left; border-bottom: 1px solid #eee; }
             .status-live { color: #28a745; font-weight: bold; }
             .btn-stop { background: #dc3545; color: white; border: none; padding: 6px 12px; cursor: pointer; border-radius: 4px; }
-            .btn-download { text-decoration: none; background: #007bff; color: white; padding: 6px 12px; border-radius: 4px; font-size: 14px; }
-            .btn-cloud { text-decoration: none; background: #6f42c1; color: white; padding: 6px 12px; border-radius: 4px; font-size: 14px; }
+            .btn-download { text-decoration: none; background: #007bff; color: white; padding: 4px 8px; border-radius: 4px; font-size: 12px; margin-right: 5px; }
+            .btn-cloud { text-decoration: none; background: #6f42c1; color: white; padding: 4px 8px; border-radius: 4px; font-size: 12px; }
+            .btn-view { text-decoration: none; background: #17a2b8; color: white; padding: 4px 8px; border-radius: 4px; font-size: 12px; }
+            .btn-outline { text-decoration: none; background: #2c3e50; color: white; padding: 4px 8px; border-radius: 4px; font-size: 12px; font-weight: bold; }
+            .badge-wait { background: #ffc107; color: #333; padding: 4px 8px; border-radius: 4px; font-size: 12px; font-weight: bold; }
         </style>
     </head>
     <body>
@@ -86,18 +109,37 @@ app.get('/', (req, res) => {
             <div class="card">
                 <h2>📂 Recording History</h2>
                 <table>
-                    <thead><tr><th>Room</th><th>Date</th><th>Duration</th><th>Actions</th></tr></thead>
+                    <thead><tr><th>Room</th><th>Date</th><th>Duration</th><th>Video (MP4)</th><th>Audio (MP3)</th><th>Transcription</th><th>Outline</th></tr></thead>
                     <tbody>
-                        ${history.map(h => `
-                        <tr>
-                            <td>${h.room}</td>
-                            <td>${new Date(h.startTime).toLocaleString()}</td>
-                            <td>${h.duration}</td>
-                            <td>
-                                <a href="/recordings/${h.filename}" class="btn-download" target="_blank">Local</a>
-                                ${h.azureUrl ? `<a href="${h.azureUrl}" class="btn-cloud" target="_blank">Azure Cloud</a>` : '<span style="color:#999; font-size:12px;">Uploading...</span>'}
-                            </td>
-                        </tr>`).join('')}
+                        ${history.map(h => {
+                            const files = h.files || {}; 
+                            const cloud = h.cloud || {};
+                            const trans = h.transcription || { status: 'none' };
+                            
+                            let transHtml = '<span style="color:#ccc">-</span>';
+                            if(trans.status === 'processing') transHtml = '<span class="badge-wait">⏳ Processing...</span>';
+                            if(trans.status === 'completed') transHtml = `<a href="/recordings/${trans.file}" class="btn-view" target="_blank">📄 View Text</a>`;
+                            if(trans.status === 'failed') transHtml = '<span style="color:red">❌ Failed</span>';
+
+                            return `
+                            <tr>
+                                <td>${h.room}</td>
+                                <td>${new Date(h.startTime).toLocaleString()}</td>
+                                <td>${h.duration}</td>
+                                <td>
+                                    ${files.mp4 ? `<a href="/recordings/${files.mp4}" class="btn-download" target="_blank">Local</a>` : ''}
+                                    ${cloud.mp4 ? `<a href="${cloud.mp4}" class="btn-cloud" target="_blank">Azure</a>` : ''}
+                                </td>
+                                <td>
+                                    ${files.mp3 ? `<a href="/recordings/${files.mp3}" class="btn-download" target="_blank">Local</a>` : ''}
+                                    ${cloud.mp3 ? `<a href="${cloud.mp3}" class="btn-cloud" target="_blank">Azure</a>` : ''}
+                                </td>
+                                <td>${transHtml}</td>
+                                <td>
+                                    ${h.outlineUrl ? `<a href="${h.outlineUrl}" class="btn-outline" target="_blank">📝 Notes</a>` : '-'}
+                                </td>
+                            </tr>`;
+                        }).join('')}
                     </tbody>
                 </table>
             </div>
@@ -122,19 +164,24 @@ app.get('/', (req, res) => {
 app.post('/api/start', (req, res) => {
     let input = req.body.roomInput.trim();
     let room = input;
+    
     if (input.includes('://')) {
         const urlParts = input.split('/');
         room = urlParts[urlParts.length - 1];
-        if (input.includes('/moderated/')) room = 'moderated/' + urlParts[urlParts.length - 1];
+        if (input.includes('/moderated/')) {
+            room = 'moderated/' + urlParts[urlParts.length - 1];
+        }
     }
 
     if (!room || activeRecordings[room]) return res.redirect('/');
 
     const safeName = room.replace(/[^a-zA-Z0-9]/g, '-');
-    const out = fs.openSync(`./logs/${safeName}.log`, 'a');
-    const err = fs.openSync(`./logs/${safeName}.log`, 'a');
+    // FIX: Use absolute path for logs
+    const out = fs.openSync(path.join(LOGS_DIR, `${safeName}.log`), 'a');
+    const err = fs.openSync(path.join(LOGS_DIR, `${safeName}.log`), 'a');
 
-    if (fs.existsSync(`./signals/stop-${safeName}`)) fs.unlinkSync(`./signals/stop-${safeName}`);
+    const signalFile = path.join(SIGNALS_DIR, `stop-${safeName}`);
+    if (fs.existsSync(signalFile)) fs.unlinkSync(signalFile);
 
     const bot = spawn('xvfb-run', [
         '--auto-servernum', '-s', '-screen 0 1920x1080x24', 
@@ -144,46 +191,80 @@ app.post('/api/start', (req, res) => {
     const startTime = Date.now();
     activeRecordings[room] = { startTime: startTime, pid: bot.pid };
 
-    // --- HANDLE COMPLETION & UPLOAD ---
-    bot.on('exit', async (code) => { // Made async
+    // --- HANDLE COMPLETION & WORKFLOW ---
+    bot.on('exit', async (code) => {
         console.log(`[API] Bot for ${room} exited.`);
         
         const durationSec = Math.floor((Date.now() - startTime) / 1000);
         const mins = Math.floor(durationSec / 60);
         const secs = durationSec % 60;
+        const durationStr = `${mins}m ${secs}s`;
 
-        const files = fs.readdirSync('./recordings')
-            .filter(f => f.startsWith(safeName) && f.endsWith('.mp4'))
-            .sort().reverse();
+        const allFiles = fs.readdirSync(RECORDINGS_DIR);
         
-        const filename = files.length > 0 ? files[0] : null;
+        const mp4File = allFiles.filter(f => f.startsWith(safeName) && f.endsWith('.mp4')).sort().reverse()[0];
+        const mp3File = allFiles.filter(f => f.startsWith(safeName) && f.endsWith('.mp3')).sort().reverse()[0];
 
-        if (filename) {
-            const localPath = path.join(__dirname, 'recordings', filename);
-            
-            // 1. Save Local History first (so user sees it immediately)
+        if (mp4File || mp3File) {
             const historyRecord = {
                 room: room,
                 startTime: startTime,
-                duration: `${mins}m ${secs}s`,
-                filename: filename,
-                azureUrl: null // Placeholder
+                duration: durationStr,
+                files: { mp4: mp4File || null, mp3: mp3File || null },
+                cloud: { mp4: null, mp3: null },
+                transcription: { status: 'none', file: null },
+                outlineUrl: null
             };
             saveHistory(historyRecord);
 
-            // 2. Trigger Azure Upload
-            console.log(`[SERVER] Starting upload for ${filename}...`);
-            const publicUrl = await uploadToAzure(safeName, localPath);
+            let mp4CloudUrl = null;
+            let mp3CloudUrl = null;
 
-            // 3. Update History with Azure URL
-            if (publicUrl) {
-                const currentHistory = getHistory();
-                // Find the record we just added (it's at index 0 usually, but let's be safe)
-                const recordIndex = currentHistory.findIndex(h => h.filename === filename);
-                if (recordIndex !== -1) {
-                    currentHistory[recordIndex].azureUrl = publicUrl;
-                    fs.writeFileSync('./history.json', JSON.stringify(currentHistory, null, 2));
-                    console.log(`[SERVER] History updated with Azure URL: ${publicUrl}`);
+            // 2. Upload MP4
+            if (mp4File) {
+                console.log(`[SERVER] Uploading MP4...`);
+                mp4CloudUrl = await uploadToAzure(safeName, path.join(RECORDINGS_DIR, mp4File));
+                if (mp4CloudUrl) updateHistoryCloudUrl(mp4File, 'mp4', mp4CloudUrl);
+            }
+
+            // 3. Upload MP3 -> Transcribe -> Outline
+            if (mp3File) {
+                console.log(`[SERVER] Uploading MP3...`);
+                mp3CloudUrl = await uploadToAzure(safeName, path.join(RECORDINGS_DIR, mp3File));
+                
+                if (mp3CloudUrl) {
+                    updateHistoryCloudUrl(mp4File, 'mp3', mp3CloudUrl);
+                    
+                    console.log(`[SERVER] Triggering Transcription...`);
+                    updateHistoryTranscriptionStatus(mp4File, 'processing', null);
+
+                    transcribeAudio(mp3CloudUrl).then(async (text) => {
+                        if (text) {
+                            const txtFilename = mp3File.replace('.mp3', '.txt');
+                            fs.writeFileSync(path.join(RECORDINGS_DIR, txtFilename), text);
+                            updateHistoryTranscriptionStatus(mp4File, 'completed', txtFilename);
+                            
+                            console.log(`[SERVER] Creating Outline Document...`);
+                            const finalMp4Url = mp4CloudUrl || "#";
+                            const dateStr = new Date().toISOString().split('T')[0];
+
+                            const outlineDocUrl = await createOutlinePage(
+                                room, 
+                                dateStr, 
+                                durationStr, 
+                                finalMp4Url, 
+                                mp3CloudUrl, 
+                                text
+                            );
+
+                            if (outlineDocUrl) {
+                                updateHistoryOutlineUrl(mp4File, outlineDocUrl);
+                            }
+
+                        } else {
+                            updateHistoryTranscriptionStatus(mp4File, 'failed', null);
+                        }
+                    });
                 }
             }
         }
@@ -195,11 +276,44 @@ app.post('/api/start', (req, res) => {
     res.redirect('/');
 });
 
+// --- HELPERS ---
+
+function updateHistoryCloudUrl(keyFile, type, url) {
+    const currentHistory = getHistory();
+    const recordIndex = currentHistory.findIndex(h => (h.files?.mp4 === keyFile) || (h.files?.mp3 === keyFile));
+    if (recordIndex !== -1) {
+        if (!currentHistory[recordIndex].cloud) currentHistory[recordIndex].cloud = {};
+        currentHistory[recordIndex].cloud[type] = url;
+        fs.writeFileSync(HISTORY_FILE, JSON.stringify(currentHistory, null, 2));
+    }
+}
+
+function updateHistoryTranscriptionStatus(keyFile, status, txtFilename) {
+    const currentHistory = getHistory();
+    const recordIndex = currentHistory.findIndex(h => (h.files?.mp4 === keyFile) || (h.files?.mp3 === keyFile));
+    if (recordIndex !== -1) {
+        currentHistory[recordIndex].transcription = {
+            status: status,
+            file: txtFilename
+        };
+        fs.writeFileSync(HISTORY_FILE, JSON.stringify(currentHistory, null, 2));
+    }
+}
+
+function updateHistoryOutlineUrl(keyFile, docUrl) {
+    const currentHistory = getHistory();
+    const recordIndex = currentHistory.findIndex(h => (h.files?.mp4 === keyFile) || (h.files?.mp3 === keyFile));
+    if (recordIndex !== -1) {
+        currentHistory[recordIndex].outlineUrl = docUrl;
+        fs.writeFileSync(HISTORY_FILE, JSON.stringify(currentHistory, null, 2));
+    }
+}
+
 app.post('/api/stop', (req, res) => {
     const room = req.body.room;
     if (activeRecordings[room]) {
         const safeName = room.replace(/[^a-zA-Z0-9]/g, '-');
-        const signalFile = `./signals/stop-${safeName}`;
+        const signalFile = path.join(SIGNALS_DIR, `stop-${safeName}`);
         fs.closeSync(fs.openSync(signalFile, 'w'));
         res.send({ success: true });
     } else {

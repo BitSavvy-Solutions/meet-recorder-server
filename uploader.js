@@ -1,4 +1,3 @@
-// uploader.js
 require('dotenv').config();
 const { BlobServiceClient } = require('@azure/storage-blob');
 const fs = require('fs');
@@ -12,36 +11,32 @@ const blobServiceClient = BlobServiceClient.fromConnectionString(AZURE_CONNECTIO
 async function uploadToAzure(roomName, filePath) {
     try {
         const containerClient = blobServiceClient.getContainerClient(CONTAINER_NAME);
-
-        // 1. Generate Date string (YYYY-MM-DD)
         const dateStr = new Date().toISOString().split('T')[0];
-        
-        // 2. Extract filename
         const fileName = path.basename(filePath);
-        
-        // 3. Construct the specific path: bitsavvy/meetings/date/meeting-name/file
-        // Azure "folders" are just prefixes in the blob name
         const blobName = `bitsavvy/meetings/${dateStr}/${roomName}/${fileName}`;
         
         const blockBlobClient = containerClient.getBlockBlobClient(blobName);
 
         console.log(`[AZURE] Uploading to: ${CONTAINER_NAME}/${blobName}`);
 
+        // --- CHANGED: Dynamic Content Type ---
+        const ext = path.extname(filePath).toLowerCase();
+        let contentType = "application/octet-stream";
+        if (ext === '.mp4') contentType = "video/mp4";
+        if (ext === '.mp3') contentType = "audio/mpeg";
+
         const stream = fs.createReadStream(filePath);
         const uploadOptions = {
-            blobHTTPHeaders: { blobContentType: "video/mp4" }
+            blobHTTPHeaders: { blobContentType: contentType }
         };
 
-        // Upload the file
         await blockBlobClient.uploadStream(stream, 4 * 1024 * 1024, 20, uploadOptions);
 
-        console.log(`[AZURE] Upload success!`);
-        
-        // Return the URL (Since your container is already set to 'Blob' access, this will work)
+        console.log(`[AZURE] Upload success: ${fileName}`);
         return blockBlobClient.url;
 
     } catch (error) {
-        console.error(`[AZURE] Upload failed: ${error.message}`);
+        console.error(`[AZURE] Upload failed for ${filePath}: ${error.message}`);
         return null;
     }
 }
