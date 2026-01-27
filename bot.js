@@ -29,7 +29,7 @@ const SIGNAL_FILE = path.join(SIGNALS_DIR, `stop-${safeFilename}`);
     console.log(`[BOT] Saving to: ${RECORDING_PATH_MP4}`);
 
     const browser = await puppeteer.launch({
-        executablePath: '/usr/bin/google-chrome', // Ensure this path is correct for your OS
+        executablePath: '/usr/bin/google-chrome',
         headless: false, 
         ignoreDefaultArgs: ['--enable-automation'], 
         args: [
@@ -42,7 +42,10 @@ const SIGNAL_FILE = path.join(SIGNALS_DIR, `stop-${safeFilename}`);
             '--start-maximized',
             '--window-position=0,0',
             '--window-size=1920,1080',
-            '--disable-dev-shm-usage'
+            '--disable-dev-shm-usage',
+            // --- NEW AUDIO FLAGS ---
+            '--disable-audio-output-resampler', // Prevents Chrome from resampling audio internally
+            '--disable-features=AudioServiceSandbox' // Helps with audio stability in Docker/Linux
         ]
     });
 
@@ -79,20 +82,30 @@ const SIGNAL_FILE = path.join(SIGNALS_DIR, `stop-${safeFilename}`);
     // Try changing 'BitSavvySink.monitor' to 'default' if you haven't set up PulseAudio sinks.
     const audioDevice = 'BitSavvySink.monitor'; 
 
+    const ffmpegEnv = { ...process.env, PULSE_LATENCY_MSEC: '60' };
+
     const ffmpeg = spawn('ffmpeg', [
         '-y', 
-        '-f', 'x11grab', '-draw_mouse', '0', '-framerate', '30', '-s', '1920x1080', '-i', displayID, 
-        '-f', 'pulse', '-i', audioDevice,
         
+        // --- INPUT SETTINGS ---
+        '-thread_queue_size', '4096', // CRITICAL: Prevents "Thread message queue blocking" (audio dropouts)
+        '-f', 'x11grab', '-draw_mouse', '0', '-framerate', '30', '-s', '2560x1440', '-i', displayID, 
+        
+        '-thread_queue_size', '4096', // Apply to audio input as well
+        '-f', 'pulse', '-ac', '2', '-ar', '48000', '-i', audioDevice, // Force Stereo (2ch) and 48kHz sample rate
+        
+        // --- VIDEO OUTPUT (MP4) ---
         '-map', '0:v', '-map', '1:a',
-        '-c:v', 'libx264', '-preset', 'superfast', '-pix_fmt', 'yuv420p',
-        '-c:a', 'aac', '-b:a', '192k', 
+        '-crf', '20', 
+        '-c:v', 'libx264', '-preset', 'veryfast', '-pix_fmt', 'yuv420p',
+        '-c:a', 'aac', '-b:a', '320k', '-ar', '48000', // Increased to 320k bitrate, locked 48kHz
         RECORDING_PATH_MP4,
 
+        // --- AUDIO OUTPUT (MP3) ---
         '-map', '1:a',
-        '-c:a', 'libmp3lame', '-q:a', '2',
+        '-c:a', 'libmp3lame', '-b:a', '320k', '-ar', '48000', // Use CBR 320k for music stability
         RECORDING_PATH_MP3
-    ]);
+    ], { env: ffmpegEnv }); // Pass the modified environment
 
     // --- CRITICAL: LOG FFMPEG ERRORS ---
     ffmpeg.stderr.on('data', (data) => {

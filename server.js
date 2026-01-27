@@ -161,8 +161,9 @@ app.post('/api/start', (req, res) => {
     const signalFile = path.join(SIGNALS_DIR, `stop-${safeName}`);
     if (fs.existsSync(signalFile)) fs.unlinkSync(signalFile);
 
+    // 2560x1440 is much sharper than 1080p but lighter than 4K
     const bot = spawn('xvfb-run', [
-        '--auto-servernum', '-s', '-screen 0 1920x1080x24', 
+        '--auto-servernum', '-s', '-screen 0 2560x1440x24', 
         'node', 'bot.js', room
     ], { detached: true, stdio: ['ignore', out, err] });
 
