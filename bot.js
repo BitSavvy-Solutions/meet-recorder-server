@@ -1,32 +1,41 @@
 const puppeteer = require('puppeteer');
 const { spawn } = require('child_process');
 const fs = require('fs');
+const path = require('path');
 
+// --- ARGUMENTS ---
 const roomName = process.argv[2];
-if (!roomName) process.exit(1);
+const outputDir = process.argv[3] || path.join(__dirname, 'recordings');
+const safeFilename = process.argv[4] || roomName.replace(/[^a-zA-Z0-9]/g, '-');
 
-const safeFilename = roomName.replace(/[^a-zA-Z0-9]/g, '-');
+if (!roomName) {
+    console.error("❌ No room name provided.");
+    process.exit(1);
+}
+
 const MEETING_URL = `https://meet.jit.si/${roomName}`;
 
-// --- CHANGED: Define paths for both files ---
-const TIMESTAMP = Date.now();
-const RECORDING_PATH_MP4 = `./recordings/${safeFilename}-${TIMESTAMP}.mp4`;
-const RECORDING_PATH_MP3 = `./recordings/${safeFilename}-${TIMESTAMP}.mp3`;
-const SIGNAL_FILE = `./signals/stop-${safeFilename}`;
+// --- PATHS ---
+if (!fs.existsSync(outputDir)) fs.mkdirSync(outputDir, { recursive: true });
 
-if (!fs.existsSync('./recordings')) fs.mkdirSync('./recordings');
+const TIMESTAMP = Date.now();
+const RECORDING_PATH_MP4 = path.join(outputDir, `${safeFilename}-${TIMESTAMP}.mp4`);
+const RECORDING_PATH_MP3 = path.join(outputDir, `${safeFilename}-${TIMESTAMP}.mp3`);
+const SIGNALS_DIR = path.join(__dirname, 'signals');
+const SIGNAL_FILE = path.join(SIGNALS_DIR, `stop-${safeFilename}`);
 
 (async () => {
     console.log(`[BOT] Launching for ${roomName}...`);
+    console.log(`[BOT] Saving to: ${RECORDING_PATH_MP4}`);
 
     const browser = await puppeteer.launch({
-        executablePath: '/usr/bin/google-chrome',
+        executablePath: '/usr/bin/google-chrome', // Ensure this path is correct for your OS
         headless: false, 
         ignoreDefaultArgs: ['--enable-automation'], 
         args: [
             '--kiosk', 
             '--disable-infobars', 
-            '--no-sandbox',
+            '--no-sandbox', 
             '--disable-setuid-sandbox',
             '--use-fake-ui-for-media-stream',
             '--autoplay-policy=no-user-gesture-required',
@@ -42,61 +51,66 @@ if (!fs.existsSync('./recordings')) fs.mkdirSync('./recordings');
 
     console.log(`[BOT] Navigating to ${MEETING_URL}`);
     await page.goto(MEETING_URL);
-    await new Promise(r => setTimeout(r, 5000));
-
+    
     // --- JOIN LOGIC ---
     try {
+        await new Promise(r => setTimeout(r, 3000));
         const nameInput = 'input[field-name="displayName"]';
         if (await page.$(nameInput)) {
-            console.log("[BOT] Entering Display Name...");
             await page.click(nameInput, { clickCount: 3 });
             await page.type(nameInput, 'BitSavvy Recorder');
             await page.keyboard.press('Enter');
             await new Promise(r => setTimeout(r, 2000)); 
         }
         
-        const joinButtonSelectors = ['[aria-label="Join meeting"]', '[data-testid="prejoin.joinMeeting"]', '.toolbox-button'];
-        for (const selector of joinButtonSelectors) {
-            if (await page.$(selector)) { 
-                console.log(`[BOT] Clicking Join Button: ${selector}`);
-                await page.click(selector); 
-                break; 
-            }
+        const joinSelectors = ['[aria-label="Join meeting"]', '[data-testid="prejoin.joinMeeting"]', '.toolbox-button'];
+        for (const s of joinSelectors) {
+            if (await page.$(s)) { await page.click(s); break; }
         }
     } catch (e) { console.log(`[BOT] Join Error: ${e.message}`); }
-    // ------------------
 
     await new Promise(r => setTimeout(r, 5000));
 
-    // --- CHANGED: FFmpeg Command for Dual Output ---
+    // --- FFMPEG RECORDING ---
     const displayID = process.env.DISPLAY || ':1'; 
-    
+    console.log(`[BOT] Using Display: ${displayID}`);
+
+    // NOTE: If 'BitSavvySink' does not exist, this will fail. 
+    // Try changing 'BitSavvySink.monitor' to 'default' if you haven't set up PulseAudio sinks.
+    const audioDevice = 'BitSavvySink.monitor'; 
+
     const ffmpeg = spawn('ffmpeg', [
         '-y', 
-        // INPUT 0: Video (Screen)
         '-f', 'x11grab', '-draw_mouse', '0', '-framerate', '30', '-s', '1920x1080', '-i', displayID, 
-        // INPUT 1: Audio (Pulse)
-        '-f', 'pulse', '-i', 'BitSavvySink.monitor',
+        '-f', 'pulse', '-i', audioDevice,
         
-        // OUTPUT 1: MP4 (Video + Audio)
-        '-map', '0:v', // Use Input 0 for Video
-        '-map', '1:a', // Use Input 1 for Audio
-        '-c:v', 'libx264', '-preset', 'superfast', '-crf', '18', '-pix_fmt', 'yuv420p',
+        '-map', '0:v', '-map', '1:a',
+        '-c:v', 'libx264', '-preset', 'superfast', '-pix_fmt', 'yuv420p',
         '-c:a', 'aac', '-b:a', '192k', 
         RECORDING_PATH_MP4,
 
-        // OUTPUT 2: MP3 (Audio Only)
-        '-map', '1:a', // Use Input 1 for Audio
-        '-c:a', 'libmp3lame', // MP3 Encoder
-        '-q:a', '2', // Quality (VBR, roughly 190kbps)
+        '-map', '1:a',
+        '-c:a', 'libmp3lame', '-q:a', '2',
         RECORDING_PATH_MP3
     ]);
 
-    console.log(`[BOT] Recording started: MP4 & MP3`);
+    // --- CRITICAL: LOG FFMPEG ERRORS ---
+    ffmpeg.stderr.on('data', (data) => {
+        // Only log errors, ignore standard frame info to keep logs clean
+        const msg = data.toString();
+        if (msg.includes('Error') || msg.includes('fail') || msg.includes('found')) {
+            console.error(`[FFMPEG ERROR] ${msg}`);
+        }
+    });
 
-    // --- STATUS CHECK LOOP ---
+    ffmpeg.on('close', (code) => {
+        console.log(`[FFMPEG] Process exited with code ${code}`);
+    });
+
+    console.log(`[BOT] Recording started...`);
+
+    // --- MONITORING LOOP ---
     let aloneCounter = 0;
-
     const checkStatus = async () => {
         if (fs.existsSync(SIGNAL_FILE)) {
             console.log("[BOT] 🛑 Stop signal received.");
@@ -111,34 +125,30 @@ if (!fs.existsSync('./recordings')) fs.mkdirSync('./recordings');
                 return { ready: true, count: APP.conference.membersCount };
             });
 
-            if (status.ready) {
-                console.log(`[HEARTBEAT] Participants: ${status.count}`);
-                if (status.count <= 1) aloneCounter++;
-                else aloneCounter = 0;
-            }
+            if (status.ready && status.count <= 1) aloneCounter++;
+            else aloneCounter = 0;
 
             if (aloneCounter >= 6) { 
                 console.log("[BOT] 📉 Meeting empty. Auto-stopping.");
                 await gracefulExit();
             }
-        } catch (e) { console.log(`[ERROR] Check loop: ${e.message}`); }
+        } catch (e) {}
     };
 
     const checkerInterval = setInterval(checkStatus, 5000);
 
     async function gracefulExit() {
         clearInterval(checkerInterval);
-        console.log("[BOT] 💾 Saving files and shutting down...");
+        console.log("[BOT] 💾 Saving files...");
         
         ffmpeg.kill('SIGINT'); 
-        await new Promise(r => setTimeout(r, 3000)); // Give slightly more time for 2 files to close
+        
+        // Wait for FFmpeg to finish writing the file trailer
+        await new Promise(r => setTimeout(r, 4000));
         
         await browser.close();
         process.exit(0);
     }
 
-    setTimeout(() => {
-        console.log("[BOT] ⏰ Time Limit Reached.");
-        gracefulExit();
-    }, 1000 * 60 * 60); 
+    setTimeout(() => gracefulExit(), 1000 * 60 * 60); 
 })();
