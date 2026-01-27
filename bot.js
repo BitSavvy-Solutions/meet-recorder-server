@@ -41,7 +41,7 @@ const SIGNAL_FILE = path.join(SIGNALS_DIR, `stop-${safeFilename}`);
             '--autoplay-policy=no-user-gesture-required',
             '--start-maximized',
             '--window-position=0,0',
-            '--window-size=1920,1080',
+            '--window-size=2560,1440',
             '--disable-dev-shm-usage',
             // --- NEW AUDIO FLAGS ---
             '--disable-audio-output-resampler', // Prevents Chrome from resampling audio internally
@@ -50,7 +50,7 @@ const SIGNAL_FILE = path.join(SIGNALS_DIR, `stop-${safeFilename}`);
     });
 
     const page = await browser.newPage();
-    await page.setViewport({ width: 1920, height: 1080 });
+    await page.setViewport({ width: 2560, height: 1440 });
 
     console.log(`[BOT] Navigating to ${MEETING_URL}`);
     await page.goto(MEETING_URL);
