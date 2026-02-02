@@ -2,15 +2,16 @@ const express = require('express');
 const { spawn } = require('child_process');
 const fs = require('fs');
 const path = require('path');
-const axios = require('axios'); // REQUIRED: npm install axios
+const axios = require('axios'); 
 
 const app = express();
 const PORT = 3001;
 
 // --- CONFIGURATION ---
-// Based on your docker-compose, your n8n is at auto.bitsavvy.ca
-// Ensure your n8n Webhook node is set to POST and path is 'process-meeting'
-const N8N_WEBHOOK_URL = 'https://auto.bitsavvy.ca/webhook/process-meeting';
+// 1. URL for the NEW workflow (Step 1)
+const N8N_START_WEBHOOK = 'https://auto.bitsavvy.ca/webhook/start-meeting';
+// 2. URL for the EXISTING workflow (Step 2)
+const N8N_FINISH_WEBHOOK = 'https://auto.bitsavvy.ca/webhook/process-meeting';
 
 // --- DIRECTORIES ---
 const LOGS_DIR = path.join(__dirname, 'logs');
@@ -140,7 +141,7 @@ app.get('/', (req, res) => {
 });
 
 // --- API: START RECORDING ---
-app.post('/api/start', (req, res) => {
+app.post('/api/start', async (req, res) => {
     let input = req.body.roomInput.trim();
     let room = input;
     
@@ -161,19 +162,43 @@ app.post('/api/start', (req, res) => {
     const signalFile = path.join(SIGNALS_DIR, `stop-${safeName}`);
     if (fs.existsSync(signalFile)) fs.unlinkSync(signalFile);
 
-    // 2560x1440 is much sharper than 1080p but lighter than 4K
+    // 1. Start the Bot
     const bot = spawn('xvfb-run', [
         '--auto-servernum', '-s', '-screen 0 2560x1440x24', 
         'node', 'bot.js', room
     ], { detached: true, stdio: ['ignore', out, err] });
 
     const startTime = Date.now();
-    activeRecordings[room] = { startTime: startTime, pid: bot.pid };
+    
+    // 2. Initialize active recording object
+    activeRecordings[room] = { 
+        startTime: startTime, 
+        pid: bot.pid,
+        documentId: null // Placeholder for Outline ID
+    };
+
+    // 3. Trigger "Start Meeting" Webhook to create Outline Doc
+    try {
+        console.log(`[SERVER] Triggering Start Webhook for ${room}...`);
+        const response = await axios.post(N8N_START_WEBHOOK, { roomName: room });
+
+        console.log(`[SERVER] Response ${JSON.stringify(response.data, null, 2)}...`);
+        
+        if (response.data && response.data.data.id) {
+            activeRecordings[room].documentId = response.data.data.id;
+            console.log(`[SERVER] ✅ Outline Doc Created. ID: ${activeRecordings[room].documentId}`);
+        }
+    } catch (error) {
+        console.error(`[SERVER] ⚠️ Failed to create initial Outline doc: ${error.message}`);
+    }
 
     // --- HANDLE COMPLETION & TRIGGER N8N ---
     bot.on('exit', async (code) => {
         console.log(`[API] Bot for ${room} exited.`);
         
+        // Retrieve the document ID we saved earlier
+        const currentDocId = activeRecordings[room] ? activeRecordings[room].documentId : null;
+
         const durationSec = Math.floor((Date.now() - startTime) / 1000);
         const mins = Math.floor(durationSec / 60);
         const secs = durationSec % 60;
@@ -181,32 +206,30 @@ app.post('/api/start', (req, res) => {
 
         const allFiles = fs.readdirSync(RECORDINGS_DIR);
         
-        // Find the files
         const mp4File = allFiles.filter(f => f.startsWith(safeName) && f.endsWith('.mp4')).sort().reverse()[0];
         const mp3File = allFiles.filter(f => f.startsWith(safeName) && f.endsWith('.mp3')).sort().reverse()[0];
 
         let n8nTriggered = false;
 
         if (mp3File && mp4File) {
-            console.log(`[SERVER] Found audio: ${mp3File}. Triggering n8n...`);
-            console.log(`[SERVER] Found audio: ${mp4File}. Triggering n8n...`);
+            console.log(`[SERVER] Found files. Triggering Finish Webhook...`);
 
             try {
-                // SEND JSON PAYLOAD (Pass by Reference)
-                await axios.post(N8N_WEBHOOK_URL, {
+                // 4. Send to "Finish" Webhook, INCLUDING the documentId
+                await axios.post(N8N_FINISH_WEBHOOK, {
                     audioFileName: mp3File, 
                     roomName: room,
                     videoFileName: mp4File,
-                    duration: durationStr
+                    duration: durationStr,
+                    documentId: currentDocId // Pass this to n8n so it knows which doc to update
                 });
-                console.log(`[SERVER] ✅ Successfully triggered n8n workflow.`);
+                console.log(`[SERVER] ✅ Successfully triggered Finish workflow.`);
                 n8nTriggered = true;
             } catch (error) {
                 console.error(`[SERVER] ❌ Failed to trigger n8n: ${error.message}`);
             }
         }
 
-        // Save History
         saveHistory({
             room: room,
             startTime: startTime,
